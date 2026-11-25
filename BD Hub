@@ -1,0 +1,781 @@
+-- Load WindUI Library
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local Camera = workspace.CurrentCamera
+
+local Config = {
+    FOVVisible = false,
+    FOVRadius = 190,
+    DeviceMode = "Mobile", -- "Mobile" or "PC"
+    AimAssistEnabled = false,
+    SilentAimEnabled = false,
+    TracerEnabled = false, -- Independent toggle for locked-target tracer line only
+
+    InfiniteStamina = false,
+    InfiniteJump = false,
+
+    AutoFarmEnabled = false,
+    FarmType = "1. Construction Farm",
+
+    BoxESP = false,
+    HealthBarESP = false,
+    NameESP = false,
+
+    SaveConfigEnabled = false,
+    AntiAFKEnabled = false
+}
+
+local State = {
+    LockedTarget = nil,
+    LockedPart = nil,
+    CurrentRefPos = Vector2.new(0, 0),
+    FarmRunning = false
+}
+
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 1.5
+FOVCircle.NumSides = 64
+FOVCircle.Radius = Config.FOVRadius
+FOVCircle.Filled = false
+FOVCircle.Visible = false
+FOVCircle.Color = Color3.fromRGB(168, 85, 247)
+
+-- Dedicated Tracer Line (only points to the single locked target when TracerEnabled is true)
+local TracerLine = Drawing.new("Line")
+TracerLine.Thickness = 1.5
+TracerLine.Color = Color3.fromRGB(255, 0, 0)
+TracerLine.Visible = false
+
+local function GetCam()
+    return workspace.CurrentCamera or Camera
+end
+
+local function GetRefScreenPos(cam)
+    if Config.DeviceMode == "PC" and Mouse then
+        return Vector2.new(Mouse.X, Mouse.Y + 36)
+    end
+    return Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+end
+
+local function IsPlayerAliveWithHead(plr)
+    if not plr or plr == LocalPlayer then return false, nil, nil end
+    local char = plr.Character
+    if not char then return false, nil, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local head = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+    if hum and hum.Health > 0 and head then
+        return true, head, hum
+    end
+    return false, nil, nil
+end
+
+local function IsPartInsideFOV(cam, part, refPos, radius)
+    if not cam or not part or not part.Parent then return false, nil, math.huge end
+    local screenPos, onScreen = cam:WorldToViewportPoint(part.Position)
+    if not onScreen or screenPos.Z <= 0 then
+        return false, screenPos, math.huge
+    end
+    local dist = (Vector2.new(screenPos.X, screenPos.Y) - refPos).Magnitude
+    return dist <= radius, screenPos, dist
+end
+
+local function HasAnyAimFeatureActive()
+    return Config.FOVVisible
+        or Config.AimAssistEnabled
+        or Config.SilentAimEnabled
+        or Config.TracerEnabled
+end
+
+local function UpdateSingleFOVLock(cam, refPos)
+    if not HasAnyAimFeatureActive() then
+        State.LockedTarget = nil
+        State.LockedPart = nil
+        return nil
+    end
+
+    if State.LockedTarget then
+        local alive, head = IsPlayerAliveWithHead(State.LockedTarget)
+        if alive and head then
+            local inside = IsPartInsideFOV(cam, head, refPos, Config.FOVRadius)
+            if inside then
+                State.LockedPart = head
+                return head
+            end
+        end
+        State.LockedTarget = nil
+        State.LockedPart = nil
+    end
+
+    local closestDist = Config.FOVRadius
+    local chosenPlr = nil
+    local chosenHead = nil
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local alive, head = IsPlayerAliveWithHead(plr)
+        if alive and head then
+            local inside, _, dist = IsPartInsideFOV(cam, head, refPos, Config.FOVRadius)
+            if inside and dist < closestDist then
+                closestDist = dist
+                chosenPlr = plr
+                chosenHead = head
+            end
+        end
+    end
+
+    State.LockedTarget = chosenPlr
+    State.LockedPart = chosenHead
+    return chosenHead
+end
+
+-- Independent Tracer updater: only draws when TracerEnabled is true AND there is a locked target
+local function UpdateLockedTracer(cam, refPos, lockedHead)
+    if not Config.TracerEnabled or not State.LockedTarget or not lockedHead or not lockedHead.Parent then
+        TracerLine.Visible = false
+        return
+    end
+
+    local targetPos, onScreen = cam:WorldToViewportPoint(lockedHead.Position)
+    if onScreen and targetPos.Z > 0 then
+        TracerLine.From = refPos
+        TracerLine.To = Vector2.new(targetPos.X, targetPos.Y)
+        TracerLine.Visible = true
+    else
+        TracerLine.Visible = false
+    end
+end
+
+local Window = WindUI:CreateWindow({
+    Title = "BD Hub",
+    Icon = "fish",
+    Author = "BD Hub",
+    Folder = "BDHub",
+
+    Size = UDim2.fromOffset(580, 460),
+    MinSize = Vector2.new(560, 350),
+    MaxSize = Vector2.new(850, 560),
+    ToggleKey = Enum.KeyCode.LeftShift,
+    Transparent = true,
+    Theme = "Dark",
+    Resizable = true,
+    SideBarWidth = 200,
+    BackgroundImageTransparency = 0.42,
+    HideSearchBar = true,
+    ScrollBarEnabled = false,
+
+    User = {
+        Enabled = false,
+        Anonymous = true,
+        Callback = function() end,
+    }
+})
+
+-- Style only the header fish icon to green and slightly larger
+task.spawn(function()
+    pcall(function()
+        task.wait(0.25)
+        local coreGui = game:GetService("CoreGui")
+        local function styleFishIcon(root)
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+                    local ancestorText = ""
+                    local p = obj.Parent
+                    for _ = 1, 5 do
+                        if not p then break end
+                        for _, ch in ipairs(p:GetChildren()) do
+                            if ch:IsA("TextLabel") and ch.Text == "BD Hub" then
+                                ancestorText = "BD Hub"
+                                break
+                            end
+                        end
+                        if ancestorText == "BD Hub" then break end
+                        p = p.Parent
+                    end
+                    if ancestorText == "BD Hub" and obj.AbsolutePosition.Y < 260 then
+                        obj.ImageColor3 = Color3.fromRGB(0, 255, 100)
+                        local curW = obj.Size.X.Offset > 0 and obj.Size.X.Offset or 22
+                        local curH = obj.Size.Y.Offset > 0 and obj.Size.Y.Offset or 22
+                        obj.Size = UDim2.fromOffset(math.floor(curW * 1.25), math.floor(curH * 1.25))
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        if not styleFishIcon(coreGui) and LocalPlayer:FindFirstChild("PlayerGui") then
+            styleFishIcon(LocalPlayer.PlayerGui)
+        end
+    end)
+end)
+
+-- ==========================================
+-- 1. Aimbot Tab
+-- ==========================================
+local AimbotTab = Window:Tab({ Title = "Aimbot", Icon = "crosshair" })
+AimbotTab:Section({ Title = "FOV & Aim Controls" })
+
+AimbotTab:Toggle({
+    Title = "Show FOV Circle",
+    Default = false,
+    Callback = function(Value)
+        Config.FOVVisible = Value
+        FOVCircle.Visible = Value
+        if not HasAnyAimFeatureActive() then
+            State.LockedTarget = nil
+            State.LockedPart = nil
+        end
+    end
+})
+
+AimbotTab:Slider({
+    Title = "FOV Radius",
+    Step = 5,
+    Value = {
+        Min = 30,
+        Max = 1000,
+        Default = 190,
+    },
+    Callback = function(Value)
+        Config.FOVRadius = Value
+        FOVCircle.Radius = Value
+    end
+})
+
+AimbotTab:Dropdown({
+    Title = "Device Mode",
+    Values = { "Mobile", "PC" },
+    Value = "Mobile",
+    Callback = function(Option)
+        local chosen = type(Option) == "table" and Option[1] or Option
+        if chosen then
+            Config.DeviceMode = chosen
+        end
+    end
+})
+
+AimbotTab:Toggle({
+    Title = "Aim Assist",
+    Default = false,
+    Callback = function(Value)
+        Config.AimAssistEnabled = Value
+        if not HasAnyAimFeatureActive() then
+            State.LockedTarget = nil
+            State.LockedPart = nil
+        end
+    end
+})
+
+AimbotTab:Toggle({
+    Title = "Silent Aim",
+    Default = false,
+    Callback = function(Value)
+        Config.SilentAimEnabled = Value
+        if not HasAnyAimFeatureActive() then
+            State.LockedTarget = nil
+            State.LockedPart = nil
+        end
+    end
+})
+
+-- Independent Locked Target Tracer Toggle
+AimbotTab:Toggle({
+    Title = "Locked Target Tracer",
+    Default = false,
+    Callback = function(Value)
+        Config.TracerEnabled = Value
+        if not Value then
+            TracerLine.Visible = false
+        end
+        if not HasAnyAimFeatureActive() then
+            State.LockedTarget = nil
+            State.LockedPart = nil
+        end
+    end
+})
+
+-- ==========================================
+-- 2. Player Tab
+-- ==========================================
+local PlayerTab = Window:Tab({ Title = "Player", Icon = "user" })
+PlayerTab:Section({ Title = "Character Toggles" })
+
+PlayerTab:Toggle({
+    Title = "Infinite Stamina",
+    Default = false,
+    Callback = function(Value)
+        Config.InfiniteStamina = Value
+    end
+})
+
+PlayerTab:Toggle({
+    Title = "Infinite Jump",
+    Default = false,
+    Callback = function(Value)
+        Config.InfiniteJump = Value
+    end
+})
+
+-- ==========================================
+-- 3. Auto Farm Tab
+-- ==========================================
+local FarmTab = Window:Tab({ Title = "Auto Farm", Icon = "sprout" })
+FarmTab:Section({ Title = "Currency & Farm Modes" })
+
+local MoneyParagraph = FarmTab:Paragraph({
+    Title = "Currency",
+    Desc = "Waiting..."
+})
+
+task.spawn(function()
+    while true do
+        pcall(function()
+            local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+            local foundText = "None"
+            if leaderstats then
+                local parts = {}
+                for _, stat in ipairs(leaderstats:GetChildren()) do
+                    if stat:IsA("ValueBase") then
+                        table.insert(parts, stat.Name .. ": " .. tostring(stat.Value))
+                    end
+                end
+                if #parts > 0 then
+                    foundText = table.concat(parts, " | ")
+                end
+            end
+            MoneyParagraph:Set({
+                Title = "Currency",
+                Desc = foundText
+            })
+        end)
+        task.wait(1)
+    end
+end)
+
+FarmTab:Dropdown({
+    Title = "Farm Mode",
+    Values = {
+        "1. Construction Farm",
+        "2. Vehicle Repair Farm",
+        "3. Garbage Collection Farm",
+        "4. Ice Cream Farm"
+    },
+    Value = "1. Construction Farm",
+    Callback = function(Option)
+        local chosen = type(Option) == "table" and Option[1] or Option
+        if chosen then
+            Config.FarmType = chosen
+        end
+    end
+})
+
+local function RunAutoFarmLoop()
+    if State.FarmRunning then return end
+    State.FarmRunning = true
+    task.spawn(function()
+        while Config.AutoFarmEnabled do
+            if Config.FarmType == "1. Construction Farm" then
+                -- Construction Farm RemoteEvent / logic here
+            elseif Config.FarmType == "2. Vehicle Repair Farm" then
+                -- Vehicle Repair Farm RemoteEvent / logic here
+            elseif Config.FarmType == "3. Garbage Collection Farm" then
+                -- Garbage Collection Farm RemoteEvent / logic here
+            elseif Config.FarmType == "4. Ice Cream Farm" then
+                -- Ice Cream Farm RemoteEvent / logic here
+            end
+            task.wait(0.5)
+        end
+        State.FarmRunning = false
+    end)
+end
+
+FarmTab:Toggle({
+    Title = "Start Auto Farm",
+    Default = false,
+    Callback = function(Value)
+        Config.AutoFarmEnabled = Value
+        if Value then
+            RunAutoFarmLoop()
+        end
+    end
+})
+-- ==========================================
+-- 4. Visuals Tab
+-- ==========================================
+local VisualsTab = Window:Tab({ Title = "Visuals", Icon = "eye" })
+VisualsTab:Section({ Title = "ESP Controls" })
+
+VisualsTab:Toggle({
+    Title = "Box ESP",
+    Default = false,
+    Callback = function(Value)
+        Config.BoxESP = Value
+    end
+})
+
+VisualsTab:Toggle({
+    Title = "Health Bar ESP",
+    Default = false,
+    Callback = function(Value)
+        Config.HealthBarESP = Value
+    end
+})
+
+VisualsTab:Toggle({
+    Title = "Name ESP",
+    Default = false,
+    Callback = function(Value)
+        Config.NameESP = Value
+    end
+})
+
+-- ==========================================
+-- 5. Settings Tab
+-- ==========================================
+local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
+SettingsTab:Section({ Title = "Config & System" })
+
+SettingsTab:Toggle({
+    Title = "Save Config (OFF = Don't Save)",
+    Default = false,
+    Callback = function(Value)
+        Config.SaveConfigEnabled = Value
+    end
+})
+
+SettingsTab:Button({
+    Title = "Save Config Now",
+    Callback = function()
+        if not Config.SaveConfigEnabled then
+            pcall(function()
+                WindUI:Notify({
+                    Title = "BD Hub",
+                    Content = "Don't Save is active.",
+                    Duration = 3
+                })
+            end)
+            return
+        end
+        pcall(function()
+            WindUI:Notify({
+                Title = "BD Hub",
+                Content = "Save Config enabled.",
+                Duration = 3
+            })
+        end)
+    end
+})
+
+SettingsTab:Toggle({
+    Title = "Anti-AFK",
+    Default = false,
+    Callback = function(Value)
+        Config.AntiAFKEnabled = Value
+    end
+})
+
+SettingsTab:Button({
+    Title = "FPS Booster",
+    Callback = function()
+        pcall(function()
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 9e9
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    obj.Material = Enum.Material.SmoothPlastic
+                    obj.Reflectance = 0
+                elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                    obj.Transparency = 1
+                elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+                    obj.Enabled = false
+                end
+            end
+        end)
+        pcall(function()
+            WindUI:Notify({
+                Title = "BD Hub",
+                Content = "FPS Booster applied.",
+                Duration = 3
+            })
+        end)
+    end
+})
+
+SettingsTab:Button({
+    Title = "Rejoin Server",
+    Callback = function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end
+})
+
+SettingsTab:Button({
+    Title = "Server Hop",
+    Callback = function()
+        local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
+        local success, result = pcall(function()
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if success and result and result.data then
+            for _, server in ipairs(result.data) do
+                if server.id ~= game.JobId and server.playing < server.maxPlayers then
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+                    break
+                end
+            end
+        end
+    end
+})
+
+local ESPObjects = {}
+local hasDrawing = pcall(function() return Drawing and Drawing.new end)
+
+local function RemovePlayerESP(plr)
+    local data = ESPObjects[plr]
+    if data then
+        for _, obj in pairs(data) do
+            pcall(function()
+                if obj and obj.Remove then
+                    obj:Remove()
+                end
+            end)
+        end
+        ESPObjects[plr] = nil
+    end
+end
+
+local function CleanupAll()
+    Config.FOVVisible = false
+    Config.AimAssistEnabled = false
+    Config.SilentAimEnabled = false
+    Config.TracerEnabled = false
+    Config.InfiniteStamina = false
+    Config.InfiniteJump = false
+    Config.AutoFarmEnabled = false
+    Config.BoxESP = false
+    Config.HealthBarESP = false
+    Config.NameESP = false
+    Config.AntiAFKEnabled = false
+
+    State.LockedTarget = nil
+    State.LockedPart = nil
+    FOVCircle.Visible = false
+    TracerLine.Visible = false
+end
+
+SettingsTab:Button({
+    Title = "Destroy UI",
+    Callback = function()
+        CleanupAll()
+        for plr in pairs(ESPObjects) do
+            RemovePlayerESP(plr)
+        end
+        table.clear(ESPObjects)
+        pcall(function()
+            FOVCircle:Remove()
+        end)
+        pcall(function()
+            TracerLine:Remove()
+        end)
+        pcall(function()
+            Window:Destroy()
+        end)
+    end
+})
+
+UserInputService.JumpRequest:Connect(function()
+    if not Config.InfiniteJump then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+LocalPlayer.Idled:Connect(function()
+    if not Config.AntiAFKEnabled then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+Players.PlayerRemoving:Connect(RemovePlayerESP)
+
+local function EnsurePlayerESP(plr)
+    if not hasDrawing then return nil end
+    if not ESPObjects[plr] then
+        local box = Drawing.new("Square")
+        box.Thickness = 1.5
+        box.Filled = false
+        box.Visible = false
+
+        local hpBg = Drawing.new("Line")
+        hpBg.Thickness = 3
+        hpBg.Color = Color3.fromRGB(0, 0, 0)
+        hpBg.Visible = false
+
+        local hpFill = Drawing.new("Line")
+        hpFill.Thickness = 1.5
+        hpFill.Visible = false
+
+        local nameTag = Drawing.new("Text")
+        nameTag.Size = 14
+        nameTag.Center = true
+        nameTag.Outline = true
+        nameTag.Color = Color3.fromRGB(255, 255, 255)
+        nameTag.Visible = false
+
+        ESPObjects[plr] = {
+            Box = box,
+            HPBg = hpBg,
+            HPFill = hpFill,
+            NameTag = nameTag
+        }
+    end
+    return ESPObjects[plr]
+end
+
+local function UpdateESP(cam)
+    local anyESP = hasDrawing and (Config.BoxESP or Config.HealthBarESP or Config.NameESP)
+    if not anyESP then
+        for plr in pairs(ESPObjects) do
+            RemovePlayerESP(plr)
+        end
+        return
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local char = plr.Character
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local head = char:FindFirstChild("Head") or hrp
+            local hum = char:FindFirstChildOfClass("Humanoid")
+
+            if hrp and head and hum and hum.Health > 0 then
+                local data = EnsurePlayerESP(plr)
+                local rootPos, onScreen = cam:WorldToViewportPoint(hrp.Position)
+                local headPos = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.8, 0))
+
+                if onScreen and rootPos.Z > 0 then
+                    local tanHalf = math.tan(math.rad(cam.FieldOfView * 0.5))
+                    local scale = 1000 / math.max(rootPos.Z * tanHalf * 2, 0.01)
+                    local w = math.clamp(math.floor(4 * scale), 8, 220)
+                    local h = math.clamp(math.floor(5.5 * scale), 12, 280)
+                    local boxPos = Vector2.new(rootPos.X - w * 0.5, rootPos.Y - h * 0.5)
+
+                    local isLockedTarget = (State.LockedTarget ~= nil and plr == State.LockedTarget)
+                    local boxColor = isLockedTarget
+                        and Color3.fromRGB(255, 0, 0)
+                        or Color3.fromRGB(255, 255, 255)
+
+                    data.Box.Visible = Config.BoxESP
+                    if Config.BoxESP then
+                        data.Box.Color = boxColor
+                        data.Box.Size = Vector2.new(w, h)
+                        data.Box.Position = boxPos
+                    end
+
+                    data.HPBg.Visible = Config.HealthBarESP
+                    data.HPFill.Visible = Config.HealthBarESP
+                    if Config.HealthBarESP then
+                        local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                        data.HPBg.From = Vector2.new(boxPos.X - 6, boxPos.Y + h)
+                        data.HPBg.To = Vector2.new(boxPos.X - 6, boxPos.Y)
+                        data.HPFill.From = Vector2.new(boxPos.X - 6, boxPos.Y + h)
+                        data.HPFill.To = Vector2.new(boxPos.X - 6, boxPos.Y + (h - (h * pct)))
+                        data.HPFill.Color = Color3.fromRGB(0, 255, 90)
+                    end
+
+                    data.NameTag.Visible = Config.NameESP
+                    if Config.NameESP then
+                        data.NameTag.Text = plr.DisplayName
+                        data.NameTag.Position = Vector2.new(headPos.X, headPos.Y - 16)
+                    end
+                else
+                    for _, obj in pairs(data) do
+                        obj.Visible = false
+                    end
+                end
+            else
+                RemovePlayerESP(plr)
+            end
+        else
+            RemovePlayerESP(plr)
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    local cam = GetCam()
+    if not cam then return end
+
+    local refPos = GetRefScreenPos(cam)
+    State.CurrentRefPos = refPos
+
+    if Config.FOVVisible then
+        FOVCircle.Position = refPos
+        FOVCircle.Radius = Config.FOVRadius
+        FOVCircle.Visible = true
+    else
+        FOVCircle.Visible = false
+    end
+
+    local lockedHead = UpdateSingleFOVLock(cam, refPos)
+    UpdateLockedTracer(cam, refPos, lockedHead)
+
+    if Config.AimAssistEnabled and lockedHead then
+        pcall(function()
+            local currentCF = cam.CFrame
+            local desiredCF = CFrame.lookAt(currentCF.Position, lockedHead.Position)
+            cam.CFrame = currentCF:Lerp(desiredCF, 0.12)
+        end)
+    end
+
+    if Config.InfiniteStamina then
+        local char = LocalPlayer.Character
+        if char then
+            pcall(function()
+                if char:GetAttribute("Stamina") ~= nil then
+                    char:SetAttribute("Stamina", 100)
+                end
+            end)
+        end
+    end
+
+    UpdateESP(cam)
+end)
+
+pcall(function()
+    if hookmetamethod and getnamecallmethod then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if Config.SilentAimEnabled and State.LockedPart and State.LockedPart.Parent then
+                if method == "Raycast" and self == workspace then
+                    local args = { ... }
+                    if typeof(args[1]) == "Vector3" then
+                        args[2] = (State.LockedPart.Position - args[1]).Unit * 1000
+                        return oldNamecall(self, table.unpack(args))
+                    end
+                elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRay" then
+                    local args = { ... }
+                    if typeof(args[1]) == "Ray" then
+                        local origin = args[1].Origin
+                        args[1] = Ray.new(origin, (State.LockedPart.Position - origin).Unit * 1000)
+                        return oldNamecall(self, table.unpack(args))
+                    end
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+    end
+end)
